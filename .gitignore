@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.swo
+*.bak
+.DS_Store
+.env
+.env.*
+result_*/
+output_images/
+pdf2image_ocr.log
+ocr_result.txt
+pdf/

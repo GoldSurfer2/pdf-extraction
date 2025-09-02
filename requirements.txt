@@ -2,5 +2,21 @@ pdf2image
 Pillow
 numpy
 opencv-python
+tqdm
+pycocotools
+torch
+torchvision
+torchaudio
+--extra-index-url https://download.pytorch.org/whl/cu121
+detectron2 @ git+https://github.com/facebookresearch/detectron2.git
 easyocr
 google-cloud-documentai
+pymupdf
+layoutparser[layoutmodels]
+layoutparser[layoutmodels]
+ultralytics
+matplotlib
+seaborn
+docling-core
+docling
+langchain-text-splitters

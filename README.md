@@ -43,3 +43,32 @@
 
 ---
 
+
+## Detectron2 기반 레이아웃 탐지 학습
+
+1) DocLayNet → COCO 변환 (로컬 캐시 사용):
+
+```bash
+python tools/doclaynet_to_coco.py --output coco_dataset --splits train validation --cache_dir DocLayNet
+```
+
+2) (선택) 검증 split 소량으로 스모크 테스트:
+
+```bash
+python tools/doclaynet_to_coco.py --output coco_dataset_small --splits validation --cache_dir DocLayNet --max_images 50
+```
+
+3) 학습 종속성 설치 (CUDA wheel index는 환경에 맞게 조정 가능):
+
+```bash
+pip install -r requirements.txt
+```
+
+4) Mask R-CNN R50-FPN 학습 시작:
+
+```bash
+python train_detectron2.py
+```
+
+학습 결과는 `outputs_detectron2/` 하위에 저장됩니다.
+

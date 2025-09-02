@@ -478,7 +478,7 @@ class AdvancedLayoutExtractor:
 
     def _detect_tables_with_opencv(self, image_np: np.ndarray) -> List[Tuple[int, int, int, int]]:
         """OpenCV로 테이블 후보 영역 감지 (픽셀 좌표 반환)
-        간단한 선 구조 기반 검출: 수평/수직 선 추출 후 합성 → 외곽선 탐지
+        개선된 선 구조 기반 검출: 수평/수직 선 추출 + 격자 교차점 검증 + 면적/비율 필터
         """
         if image_np is None or image_np.size == 0:
             return []
@@ -488,38 +488,298 @@ class AdvancedLayoutExtractor:
                 gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
             else:
                 gray = rgb
+            
             # 이진화
             _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            # 커널 크기 설정
+            
+            # 커널 크기 설정 (더 엄격하게)
             h, w = th.shape[:2]
-            horiz_kernel_len = max(10, w // 40)
-            vert_kernel_len = max(10, h // 40)
+            horiz_kernel_len = max(15, w // 30)  # 더 긴 선만 감지
+            vert_kernel_len = max(15, h // 30)
+            
             horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (horiz_kernel_len, 1))
             vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vert_kernel_len))
+            
             # 선 추출
             detect_horizontal = cv2.erode(th, horizontal_kernel, iterations=1)
             detect_horizontal = cv2.dilate(detect_horizontal, horizontal_kernel, iterations=1)
             detect_vertical = cv2.erode(th, vertical_kernel, iterations=1)
             detect_vertical = cv2.dilate(detect_vertical, vertical_kernel, iterations=1)
+            
+            # 교차점 검출로 격자 구조 확인
+            intersection = cv2.bitwise_and(detect_horizontal, detect_vertical)
+            
             table_mask = cv2.bitwise_or(detect_horizontal, detect_vertical)
+            
             # 후처리
             kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
             table_mask = cv2.morphologyEx(table_mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
             
             contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             boxes: List[Tuple[int, int, int, int]] = []
+            
             for cnt in contours:
                 x, y, bw, bh = cv2.boundingRect(cnt)
                 area = bw * bh
-                if area < 5000:
+                
+                # 강화된 필터링
+                if area < 8000:  # 최소 면적 증가
                     continue
-                # 너무 가늘거나 긴 라인 박스 제외
-                if min(bw, bh) < 20:
+                if min(bw, bh) < 30:  # 최소 변 길이 증가
                     continue
-                boxes.append((x, y, x + bw, y + bh))
+                
+                # 종횡비 제한 (너무 길거나 높은 박스 제외)
+                aspect_ratio = max(bw, bh) / min(bw, bh)
+                if aspect_ratio > 8:  # 8:1 비율 초과 제외
+                    continue
+                
+                # 교차점 밀도 검사 (격자 구조 확인)
+                roi_intersection = intersection[y:y+bh, x:x+bw]
+                intersection_count = cv2.countNonZero(roi_intersection)
+                intersection_density = intersection_count / area if area > 0 else 0
+                
+                if intersection_density < 0.0001:  # 교차점이 거의 없으면 제외
+                    continue
+                
+                # 3D 다이어그램 vs 표 구분 (추가 검증)
+                if not self._is_likely_table(x, y, bw, bh, detect_horizontal, detect_vertical, intersection):
+                    continue
+                
+                # 텍스트 패턴 기반 표 검증 (최종 필터)
+                if not self._validate_table_content(image_np, x, y, bw, bh):
+                    continue
+                
+                # 큰 영역은 여러 표로 분할 시도
+                if bw > w * 0.6 and bh > h * 0.3:  # 페이지의 60% 너비, 30% 높이 초과
+                    split_boxes = self._split_large_table_region(
+                        (x, y, x + bw, y + bh), detect_horizontal, detect_vertical, intersection
+                    )
+                    boxes.extend(split_boxes)
+                else:
+                    boxes.append((x, y, x + bw, y + bh))
+            
             return boxes
         except Exception:
             return []
+
+    def _split_large_table_region(self, bbox: Tuple[int, int, int, int], 
+                                 h_lines: np.ndarray, v_lines: np.ndarray, 
+                                 intersections: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        """큰 테이블 영역을 여러 개의 작은 표로 분할"""
+        x0, y0, x1, y1 = bbox
+        w, h = x1 - x0, y1 - y0
+        
+        # ROI 추출
+        roi_h = h_lines[y0:y1, x0:x1]
+        roi_v = v_lines[y0:y1, x0:x1]
+        roi_intersect = intersections[y0:y1, x0:x1]
+        
+        split_boxes = []
+        
+        try:
+            # 수직 분할선 찾기 (중앙 근처의 강한 수직선)
+            v_profile = np.sum(roi_v, axis=0)  # 각 x 좌표별 수직선 강도
+            center_x = w // 2
+            search_range = w // 4
+            
+            # 중앙 ±25% 범위에서 가장 강한 수직선 찾기
+            start_x = max(0, center_x - search_range)
+            end_x = min(w, center_x + search_range)
+            
+            if end_x > start_x:
+                center_region = v_profile[start_x:end_x]
+                if len(center_region) > 0 and np.max(center_region) > 0:
+                    local_max_idx = np.argmax(center_region)
+                    split_x = start_x + local_max_idx
+                    
+                    # 분할선이 충분히 길고 교차점이 있는지 확인
+                    split_line_strength = np.sum(roi_v[:, split_x])
+                    split_intersections = np.sum(roi_intersect[:, split_x])
+                    
+                    if split_line_strength > h * 0.3 and split_intersections > 2:
+                        # 좌측 표
+                        left_box = (x0, y0, x0 + split_x, y1)
+                        # 우측 표  
+                        right_box = (x0 + split_x, y0, x1, y1)
+                        
+                        # 각 분할된 영역이 최소 크기를 만족하는지 확인
+                        left_w, left_h = split_x, h
+                        right_w, right_h = w - split_x, h
+                        
+                        if (left_w > 50 and left_h > 50 and left_w * left_h > 5000 and
+                            right_w > 50 and right_h > 50 and right_w * right_h > 5000):
+                            split_boxes.extend([left_box, right_box])
+                            return split_boxes
+            
+            # 분할 실패 시 원본 반환
+            split_boxes.append(bbox)
+            
+        except Exception:
+            # 오류 시 원본 반환
+            split_boxes.append(bbox)
+        
+        return split_boxes
+
+    def _is_likely_table(self, x: int, y: int, w: int, h: int, 
+                        h_lines: np.ndarray, v_lines: np.ndarray, 
+                        intersections: np.ndarray) -> bool:
+        """영역이 표일 가능성을 종합 평가"""
+        try:
+            # ROI 추출
+            roi_h = h_lines[y:y+h, x:x+w]
+            roi_v = v_lines[y:y+h, x:x+w]
+            roi_intersect = intersections[y:y+h, x:x+w]
+            
+            # 1. 격자 패턴 검사 (수평선과 수직선의 균형)
+            h_line_count = np.sum(roi_h > 0)
+            v_line_count = np.sum(roi_v > 0)
+            total_pixels = w * h
+            
+            h_line_ratio = h_line_count / total_pixels if total_pixels > 0 else 0
+            v_line_ratio = v_line_count / total_pixels if total_pixels > 0 else 0
+            
+            # 수평선과 수직선이 모두 적절히 있어야 함
+            if h_line_ratio < 0.01 or v_line_ratio < 0.01:
+                return False
+            
+            # 2. 교차점 분포 검사 (규칙적인 격자인지)
+            intersection_count = np.sum(roi_intersect > 0)
+            intersection_density = intersection_count / total_pixels if total_pixels > 0 else 0
+            
+            # 교차점이 너무 적으면 단순 박스/다이어그램
+            if intersection_density < 0.0002:
+                return False
+            
+            # 3. 선분의 연속성 검사 (표는 연속된 선이 많음)
+            # 수평선 연속성
+            h_profile = np.sum(roi_h, axis=1)  # 각 행별 수평선 강도
+            h_continuous_rows = np.sum(h_profile > w * 0.1)  # 너비의 10% 이상 선이 있는 행
+            h_continuity = h_continuous_rows / h if h > 0 else 0
+            
+            # 수직선 연속성  
+            v_profile = np.sum(roi_v, axis=0)  # 각 열별 수직선 강도
+            v_continuous_cols = np.sum(v_profile > h * 0.1)  # 높이의 10% 이상 선이 있는 열
+            v_continuity = v_continuous_cols / w if w > 0 else 0
+            
+            # 4. 종합 점수 계산
+            grid_score = min(h_line_ratio, v_line_ratio) * 100  # 균형잡힌 격자
+            intersection_score = intersection_density * 10000  # 교차점 밀도
+            continuity_score = (h_continuity + v_continuity) / 2 * 10  # 선분 연속성
+            
+            total_score = grid_score + intersection_score + continuity_score
+            
+            # 5. 임계값 기준 판단
+            # 표: 격자 패턴 + 교차점 + 연속성 모두 양호
+            # 다이어그램: 불규칙한 선분, 교차점 부족, 연속성 낮음
+            return total_score > 1.5  # 경험적 임계값
+            
+        except Exception:
+            return True  # 오류 시 보수적으로 표로 간주
+
+    def _validate_table_content(self, image_np: np.ndarray, x: int, y: int, w: int, h: int) -> bool:
+        """텍스트 패턴 기반으로 표 내용 검증"""
+        try:
+            # ROI 추출
+            roi = image_np[y:y+h, x:x+w]
+            if roi.size == 0:
+                return False
+            
+            # OCR로 텍스트 추출 (Tesseract 사용)
+            if not TESSERACT_AVAILABLE:
+                logger.warning("Tesseract OCR이 사용 불가능합니다. 텍스트 검증을 건너뜁니다.")
+                return True  # OCR 없으면 통과
+            
+            try:
+                # 이미지 전처리 (OCR 정확도 향상)
+                if len(roi.shape) == 3:
+                    gray_roi = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+                else:
+                    gray_roi = roi
+                
+                # 이진화로 텍스트 선명하게
+                _, binary_roi = cv2.threshold(gray_roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                
+                # OCR 실행 (한글+영어)
+                ocr_text = pytesseract.image_to_string(
+                    binary_roi, 
+                    lang='kor+eng',
+                    config='--psm 6'  # 단일 텍스트 블록으로 처리
+                ).strip()
+                
+                if not ocr_text:
+                    return False  # 텍스트가 없으면 표가 아님
+                
+                # 표 특징적 텍스트 패턴 정의
+                table_patterns = [
+                    # 감쇠력 관련 패턴
+                    '하-약', '하-중', '하-강',
+                    '중-약', '중-중', '중-강',
+                    '상-약', '상-중', '상-강',
+                    # 음식 관련 패턴
+                    '잔', '그릇', '접시',
+                    '음료', '국', '탕',
+                    '없음', '이상',
+                    # 숫자 패턴
+                    '1-2', '2-3', '3-4', '4-5',
+                    # 일반적인 표 패턴
+                    '구분', '항목', '내용', '값',
+                    '분류', '종류', '유형'
+                ]
+                
+                # 3D 다이어그램/기술 문서 특징적 패턴 (제외 대상)
+                diagram_patterns = [
+                    '카메라', '센서', '활용',
+                    '3D', '모델', '렌더링',
+                    '투명', '반투명', '그라데이션',
+                    '레이어', '층', '단계',
+                    'Plot', 'Diagram', 'Model',
+                    'SAMSUNG', 'Research',  # 브랜드명도 제외
+                    '감쇠력', '조절', '판단'  # 제목도 제외 (표 내용이 아님)
+                ]
+                
+                # 패턴 매칭 점수 계산
+                table_score = 0
+                diagram_score = 0
+                
+                ocr_lower = ocr_text.lower()
+                
+                for pattern in table_patterns:
+                    if pattern in ocr_text or pattern.lower() in ocr_lower:
+                        table_score += 1
+                
+                for pattern in diagram_patterns:
+                    if pattern in ocr_text or pattern.lower() in ocr_lower:
+                        diagram_score += 1
+                
+                # 판단 로직 (더 엄격하게)
+                if diagram_score > 0:  # 다이어그램 패턴이 하나라도 있으면 제외
+                    logger.info(f"다이어그램으로 판단: diagram_score={diagram_score}, table_score={table_score}, text='{ocr_text[:50]}'")
+                    return False
+                
+                if table_score >= 3:  # 표 패턴이 3개 이상 있어야 표로 판단 (더 엄격)
+                    logger.info(f"표로 판단: table_score={table_score}, text='{ocr_text[:50]}'")
+                    return True
+                
+                # 패턴이 부족하면 의심
+                if table_score < 2:
+                    logger.info(f"패턴 부족으로 제외: table_score={table_score}, text='{ocr_text[:50]}'")
+                    return False
+                
+                # 텍스트가 너무 적거나 패턴이 없으면 의심
+                if len(ocr_text.strip()) < 5:
+                    logger.debug(f"텍스트 부족으로 제외: text='{ocr_text}'")
+                    return False
+                
+                # 기본적으로 통과 (보수적)
+                return True
+                
+            except Exception as e:
+                logger.debug(f"OCR 실행 오류: {e}")
+                return True  # OCR 오류 시 보수적으로 통과
+                
+        except Exception as e:
+            logger.debug(f"텍스트 검증 오류: {e}")
+            return True  # 전체 오류 시 보수적으로 통과
 
 
 # 사용 예시

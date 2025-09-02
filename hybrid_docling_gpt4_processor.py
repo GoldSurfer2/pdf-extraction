@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 
 # PDF 이미지 변환
 import fitz  # PyMuPDF
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 # 고도화 레이아웃 추출기(시각 레이아웃 보존)
 try:
@@ -368,23 +368,60 @@ class HybridDoclingGPT4Processor:
             return {"tables": [], "figures": [], "elements": [], "method": "error"}
 
     def _merge_layout_into_docling(self, docling_result: Dict[str, Any], layout_data: Dict[str, Any]) -> None:
-        """고도화 레이아웃의 표/그림을 Docling 결과에 병합(중복 단순 허용)"""
+        """고도화 레이아웃의 표/그림을 Docling 결과에 병합 + 교차검증 필터링"""
         if not docling_result:
             return
+        
+        # Docling에서 감지한 페이지별 표/이미지 개수 수집
+        docling_table_pages = set()
+        docling_image_pages = set()
+        
+        for t in docling_result.get("tables", []):
+            docling_table_pages.add(int(t.get("page", 1)))
+        for img in docling_result.get("image_locations", []):
+            docling_image_pages.add(int(img.get("page", 1)))
+        
         dl_tables = docling_result.get("tables", [])
         dl_images = docling_result.get("image_locations", [])
+        
+        # 교차검증: Docling이 표를 감지한 페이지의 레이아웃 표만 추가
+        validated_tables = 0
         for t in layout_data.get("tables", []):
-            dl_tables.append({
-                "text": "",
-                "page": int(t.get("page", 1))
-            })
+            page = int(t.get("page", 1))
+            confidence = float(t.get("confidence", 0.65))
+            
+            # Docling이 같은 페이지에서 표를 감지했거나, confidence가 높으면 허용
+            if page in docling_table_pages or confidence > 0.8:
+                dl_tables.append({
+                    "text": "",
+                    "page": page,
+                    "bbox": t.get("bbox", []),
+                    "confidence": confidence,
+                    "source": "layout_validated"
+                })
+                validated_tables += 1
+        
+        # 그림은 더 관대하게 (Docling이 놓치는 경우가 많음)
+        validated_figures = 0
         for f in layout_data.get("figures", []):
-            dl_images.append({
-                "page": int(f.get("page", 1)),
-                "caption": f.get("caption", "")
-            })
+            page = int(f.get("page", 1))
+            confidence = float(f.get("confidence", 0.70))
+            
+            # confidence 0.6 이상이면 추가
+            if confidence >= 0.6:
+                dl_images.append({
+                    "page": page,
+                    "caption": f.get("caption", ""),
+                    "bbox": f.get("bbox", []),
+                    "confidence": confidence,
+                    "source": "layout_detected"
+                })
+                validated_figures += 1
+        
         docling_result["tables"] = dl_tables
         docling_result["image_locations"] = dl_images
+        
+        logger.info(f"레이아웃 병합 완료: 표 {validated_tables}개, 그림 {validated_figures}개 추가")
     
     def _analyze_all_visuals(self, image: Image.Image, page_num: int) -> str:
         """
@@ -555,6 +592,7 @@ def main():
     parser.add_argument("--max-pages", type=int, default=None, help="GPT-4o-mini로 분석할 최대 페이지 수 (None이면 전체 페이지)")
     parser.add_argument("--page", type=int, default=None, help="특정 1-based 페이지만 처리 (Docling+GPT 대상)")
     parser.add_argument("--timestamp", action="store_true", help="출력 파일명에 생성 시각 접미사 추가")
+    parser.add_argument("--debug-overlay", type=str, default=None, help="디버그 오버레이 이미지 저장 디렉토리")
     parser.add_argument("--doc-pages", type=int, default=None, help="Docling/GPT 모두 앞쪽 N페이지만 처리")
     
     args = parser.parse_args()
@@ -577,6 +615,10 @@ def main():
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
         
+        # 디버그 오버레이 생성
+        if args.debug_overlay:
+            processor._create_debug_overlay(args.pdf, result, args.debug_overlay)
+        
         logger.info(f"하이브리드 처리 결과가 {output_path}에 저장되었습니다")
         
         # 요약 출력
@@ -591,6 +633,130 @@ def main():
     except Exception as e:
         logger.error(f"처리 중 오류 발생: {e}")
         raise
+
+    def _create_debug_overlay(self, pdf_path: str, result: Dict[str, Any], debug_dir: str) -> None:
+        """디버그 오버레이 이미지 생성 - 검출된 표/그림 bbox를 시각화"""
+        try:
+            import os
+            os.makedirs(debug_dir, exist_ok=True)
+            
+            doc = fitz.open(pdf_path)
+            layout_data = result.get("layout_preserved", {})
+            
+            for page_idx in range(doc.page_count):
+                page = doc[page_idx]
+                page_num = page_idx + 1
+                
+                # 고해상도 이미지 생성
+                mat = fitz.Matrix(2.0, 2.0)
+                pix = page.get_pixmap(matrix=mat)
+                img_data = pix.tobytes("png")
+                image = Image.open(BytesIO(img_data))
+                
+                # 오버레이 그리기
+                draw = ImageDraw.Draw(image)
+                img_w, img_h = image.size
+                
+                # 해당 페이지의 요소들 필터링
+                page_elements = [e for e in layout_data.get("elements", []) 
+                               if e.get("page") == page_num]
+                
+                for element in page_elements:
+                    bbox = element.get("bbox", [])
+                    if len(bbox) != 4:
+                        continue
+                    
+                    # 정규화된 좌표를 픽셀 좌표로 변환
+                    x0, y0, x1, y1 = bbox
+                    px0 = int(x0 * img_w)
+                    py0 = int(y0 * img_h)
+                    px1 = int(x1 * img_w)
+                    py1 = int(y1 * img_h)
+                    
+                    # 타입별 색상
+                    element_type = element.get("type", "unknown")
+                    colors = {
+                        "table": "red",
+                        "figure": "blue", 
+                        "title": "green",
+                        "paragraph": "orange"
+                    }
+                    color = colors.get(element_type, "gray")
+                    
+                    # 박스 그리기
+                    draw.rectangle([px0, py0, px1, py1], outline=color, width=3)
+                    
+                    # 라벨 추가
+                    confidence = element.get("confidence", 0.0)
+                    label = f"{element_type} ({confidence:.2f})"
+                    
+                    try:
+                        # 기본 폰트 사용
+                        draw.text((px0, py0-20), label, fill=color)
+                    except Exception:
+                        # 폰트 로드 실패 시 라벨 생략
+                        pass
+                
+                # 저장
+                output_path = os.path.join(debug_dir, f"page_{page_num:03d}_overlay.png")
+                image.save(output_path)
+                logger.info(f"디버그 오버레이 저장: {output_path}")
+            
+            doc.close()
+            
+        except Exception as e:
+            logger.warning(f"디버그 오버레이 생성 실패: {e}")
+
+
+def main():
+    """메인 실행 함수"""
+    parser = argparse.ArgumentParser(description="하이브리드 Docling + GPT-4o-mini 문서 처리기")
+    parser.add_argument("--pdf", type=str, required=True, help="처리할 PDF 파일 경로")
+    parser.add_argument("--output", type=str, default="beverage_tech_result.json", help="결과 저장 파일명")
+    parser.add_argument("--max-pages", type=int, default=None, help="GPT-4o-mini로 분석할 최대 페이지 수 (None이면 전체 페이지)")
+    parser.add_argument("--page", type=int, default=None, help="특정 1-based 페이지만 처리 (Docling+GPT 대상)")
+    parser.add_argument("--timestamp", action="store_true", help="출력 파일명에 생성 시각 접미사 추가")
+    parser.add_argument("--debug-overlay", type=str, default=None, help="디버그 오버레이 이미지 저장 디렉토리")
+    parser.add_argument("--doc-pages", type=int, default=None, help="Docling/GPT 모두 앞쪽 N페이지만 처리")
+    
+    args = parser.parse_args()
+    
+    try:
+        processor = HybridDoclingGPT4Processor()
+        
+        # 하이브리드 처리 실행
+        selected_pages = [args.page] if args.page else None
+        result = processor.process_hybrid(args.pdf, args.max_pages, args.doc_pages, selected_pages)
+        
+        # 결과 저장(타임스탬프 옵션)
+        output_path = args.output
+        if args.timestamp:
+            stem = Path(output_path).stem
+            suffix = Path(output_path).suffix or ".json"
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = str(Path(output_path).with_name(f"{stem}_{ts}{suffix}"))
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        
+        # 디버그 오버레이 생성
+        if args.debug_overlay:
+            processor._create_debug_overlay(args.pdf, result, args.debug_overlay)
+        
+        logger.info(f"하이브리드 처리 결과가 {output_path}에 저장되었습니다")
+        
+        # 요약 출력
+        print(f"\n=== 하이브리드 처리 결과 ===")
+        print(f"PDF: {result['source_pdf']}")
+        print(f"처리 방식: {result['processing_method']}")
+        print(f"총 페이지: {result['summary']['total_pages']}")
+        print(f"복잡한 시각요소 페이지: {result['summary']['pages_with_visuals']}")
+        print(f"표: {result['summary']['tables_found']}개")
+        print(f"이미지: {result['summary']['images_found']}개")
+        
+    except Exception as e:
+        logger.error(f"처리 중 오류 발생: {e}")
+        raise
+
 
 if __name__ == "__main__":
     main()

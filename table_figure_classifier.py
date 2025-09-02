@@ -21,7 +21,7 @@ class TableFigureClassifier:
             'caption_is_table': 1.2,
             'rich_texture_score': -0.7  # 음수: 질감이 복잡하면 그림
         }
-        self.threshold = 1.2
+        self.threshold = 0.8  # 더 관대하게 (1.2 → 0.8)
     
     def extract_features(self, region_bbox: List[float], page_image: np.ndarray, 
                         pdf_lines: List = None, text_blocks: List = None) -> Dict[str, float]:
@@ -253,7 +253,57 @@ class TableFigureClassifier:
     def classify_region(self, region_bbox: List[float], page_image: np.ndarray,
                        pdf_lines: List = None, text_blocks: List = None) -> Tuple[str, float, Dict]:
         """영역 분류 (원스톱)"""
+        # 1단계: 텍스트 부재 시 강력한 거부
+        if not self._has_meaningful_text(region_bbox, page_image):
+            return "figure", 0.1, {"reason": "no_text_detected"}
+        
         features = self.extract_features(region_bbox, page_image, pdf_lines, text_blocks)
         classification, score = self.classify(features)
         
         return classification, score, features
+    
+    def _has_meaningful_text(self, region_bbox: List[float], page_image: np.ndarray) -> bool:
+        """영역에 의미있는 텍스트가 있는지 OCR로 직접 확인"""
+        try:
+            import pytesseract
+            
+            x0, y0, x1, y1 = region_bbox
+            h, w = page_image.shape[:2]
+            
+            # 픽셀 좌표로 변환
+            px0, py0 = int(x0 * w), int(y0 * h)
+            px1, py1 = int(x1 * w), int(y1 * h)
+            
+            # ROI 추출
+            roi = page_image[py0:py1, px0:px1]
+            if roi.size == 0:
+                return False
+            
+            # OCR 실행
+            if len(roi.shape) == 3:
+                gray_roi = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+            else:
+                gray_roi = roi
+            
+            # 이진화
+            _, binary_roi = cv2.threshold(gray_roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # OCR로 텍스트 추출
+            ocr_text = pytesseract.image_to_string(
+                binary_roi, 
+                lang='kor+eng',
+                config='--psm 6'
+            ).strip()
+            
+            # 텍스트 검증
+            if len(ocr_text) < 3:  # 3글자 미만은 의미없음
+                return False
+            
+            # 알파벳/한글/숫자가 포함되어야 함
+            has_meaningful_chars = any(c.isalnum() or ord(c) > 127 for c in ocr_text)
+            
+            return has_meaningful_chars
+            
+        except Exception as e:
+            # OCR 실패 시 보수적으로 False (텍스트 없음으로 간주)
+            return False

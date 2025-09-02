@@ -23,6 +23,9 @@ from PIL import Image
 import cv2
 from statistics import median
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # OCR 엔진(pytesseract) 선택적 사용
 try:
     import pytesseract
@@ -30,18 +33,13 @@ try:
 except Exception:
     PYTESSERACT_AVAILABLE = False
 
-# 새로운 분류기 모듈
+# AI 기반 분류기 모듈
 try:
-    from table_figure_classifier import TableFigureClassifier
-    from pdf_vector_utils import PDFVectorExtractor
-    ENHANCED_CLASSIFIER_AVAILABLE = True
+    from ai_layout_classifier import AILayoutClassifier
+    AI_CLASSIFIER_AVAILABLE = True
 except ImportError:
-    ENHANCED_CLASSIFIER_AVAILABLE = False
-    logger.warning("Enhanced classifier modules not found. Using fallback methods.")
-    pytesseract = None
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+    AI_CLASSIFIER_AVAILABLE = False
+    logger.warning("AI classifier module not found. Using fallback methods.")
 
 class ElementType(Enum):
     """문서 요소 타입 정의"""
@@ -103,6 +101,14 @@ class AdvancedLayoutExtractor:
         # 2. OCR 설정 (선택적)
         self.use_tesseract_ocr = bool(use_tesseract_ocr and PYTESSERACT_AVAILABLE)
         self.tesseract_languages = tesseract_languages
+        
+        # 3. AI 분류기 초기화
+        if AI_CLASSIFIER_AVAILABLE:
+            self.ai_classifier = AILayoutClassifier()
+            logger.info("GPT-4V 기반 AI 분류기 초기화 완료")
+        else:
+            self.ai_classifier = None
+            logger.warning("AI 분류기 사용 불가, 기본 방식 사용")
         
         logger.info(
             "고도화된 레이아웃 추출기 초기화 완료 (Detectron2 미사용, Tesseract OCR: %s)",
@@ -169,6 +175,84 @@ class AdvancedLayoutExtractor:
         except Exception as e:
             logger.error(f"Docling 추출 실패: {e}")
             return {"error": str(e), "method": "docling"}
+
+    def _extract_with_ai_classification(self, pdf_path: str) -> Dict[str, Any]:
+        """AI 기반 레이아웃 추출 (OpenCV 후보 검출 + GPT-4V 분류)"""
+        logger.info("AI 기반 레이아웃 추출 시작")
+        
+        try:
+            doc = fitz.open(pdf_path)
+            pages = []
+            
+            for page_idx in range(doc.page_count):
+                page = doc[page_idx]
+                
+                # 고해상도 이미지 생성
+                mat = fitz.Matrix(3.0, 3.0)
+                pix = page.get_pixmap(matrix=mat)
+                img_data = pix.tobytes("png")
+                
+                # numpy 배열로 변환
+                image = Image.open(io.BytesIO(img_data))
+                image_np = np.array(image)
+                
+                # 1단계: OpenCV로 후보 영역 검출 (단순화)
+                candidate_bboxes = self._detect_candidate_regions_simple(image_np)
+                
+                # 2단계: AI로 영역 분류
+                if self.ai_classifier and candidate_bboxes:
+                    classifications = self.ai_classifier.classify_regions(image_np, candidate_bboxes)
+                else:
+                    # AI 분류기 없으면 모든 후보를 figure로 처리
+                    classifications = [
+                        {"bbox": bbox, "classification": "figure", "confidence": 0.5, "method": "fallback"}
+                        for bbox in candidate_bboxes
+                    ]
+                
+                # 3단계: 분류 결과를 LayoutElement로 변환
+                elements = []
+                for result in classifications:
+                    bbox = result["bbox"]
+                    classification = result["classification"]
+                    confidence = result["confidence"]
+                    
+                    # 분류에 따른 ElementType 매핑
+                    if classification == "table":
+                        element_type = ElementType.TABLE
+                    elif classification == "chart":
+                        element_type = ElementType.FIGURE  # 차트도 figure로 처리
+                    elif classification == "text":
+                        element_type = ElementType.PARAGRAPH
+                    else:  # figure
+                        element_type = ElementType.FIGURE
+                    
+                    element = LayoutElement(
+                        element_type=element_type,
+                        bbox=bbox,
+                        content="",
+                        confidence=confidence,
+                        page_num=page_idx,
+                        hierarchy_level=0
+                    )
+                    elements.append(element)
+                
+                pages.append({
+                    "page": page_idx,
+                    "elements": elements
+                })
+                
+                logger.info(f"페이지 {page_idx+1}: {len(candidate_bboxes)}개 후보 → {len(elements)}개 요소")
+            
+            doc.close()
+            
+            return {
+                "pages": pages,
+                "method": "ai_gpt4v"
+            }
+            
+        except Exception as e:
+            logger.error(f"AI 레이아웃 추출 실패: {e}")
+            return {"pages": [], "method": "error"}
 
     def _extract_with_visual_analysis(self, pdf_path: str) -> Dict[str, Any]:
         """PyMuPDF 텍스트/이미지 블록 + OpenCV 테이블 검출 + 선택적 Tesseract OCR"""
@@ -554,9 +638,22 @@ class AdvancedLayoutExtractor:
                 if not self._is_likely_table(x, y, bw, bh, detect_horizontal, detect_vertical, intersection):
                     continue
                 
-                # 텍스트 패턴 기반 표 검증 (최종 필터)
-                if not self._validate_table_content(image_np, x, y, bw, bh):
-                    continue
+                # 새로운 증거 기반 분류기 사용 (우선)
+                if self.table_figure_classifier:
+                    region_bbox = [x/w, y/h, (x+bw)/w, (y+bh)/h]  # 정규화된 좌표
+                    classification, score, features = self.table_figure_classifier.classify_region(
+                        region_bbox, image_np, None, None
+                    )
+                    logger.info(f"증거 기반 분류기: {classification} (score: {score:.3f}, features: {features})")
+                    if classification != "table":
+                        logger.info(f"영역 제외됨: {classification} (score: {score:.3f})")
+                        continue
+                    else:
+                        logger.info(f"표로 분류됨: score={score:.3f}")
+                else:
+                    # 텍스트 패턴 기반 표 검증 (폴백)
+                    if not self._validate_table_content(image_np, x, y, bw, bh):
+                        continue
                 
                 # 큰 영역은 여러 표로 분할 시도
                 if bw > w * 0.6 and bh > h * 0.3:  # 페이지의 60% 너비, 30% 높이 초과
@@ -694,7 +791,7 @@ class AdvancedLayoutExtractor:
                 return False
             
             # OCR로 텍스트 추출 (Tesseract 사용)
-            if not TESSERACT_AVAILABLE:
+            if not PYTESSERACT_AVAILABLE:
                 logger.warning("Tesseract OCR이 사용 불가능합니다. 텍스트 검증을 건너뜁니다.")
                 return True  # OCR 없으면 통과
             
@@ -791,7 +888,210 @@ class AdvancedLayoutExtractor:
             return True  # 전체 오류 시 보수적으로 통과
 
 
-# 사용 예시
+    def _detect_candidate_regions_simple(self, image_np: np.ndarray) -> List[List[float]]:
+        """개선된 후보 영역 검출 (표 분리 검출 포함)"""
+        try:
+            if image_np is None or image_np.size == 0:
+                return []
+            
+            # 그레이스케일 변환
+            if len(image_np.shape) == 3:
+                gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = image_np
+            
+            h, w = gray.shape
+            
+            # 1. 표 구조 검출 (수평/수직선 기반)
+            table_candidates = self._detect_table_regions(gray)
+            
+            # 2. 일반 윤곽선 검출 (그림/다이어그램용)
+            figure_candidates = self._detect_figure_regions(gray)
+            
+            # 3. 결합 및 중복 제거
+            all_candidates = table_candidates + figure_candidates
+            filtered_candidates = self._remove_overlapping_candidates(all_candidates)
+            
+            logger.info(f"후보 영역 검출: 표 {len(table_candidates)}개, 그림 {len(figure_candidates)}개 → 최종 {len(filtered_candidates)}개")
+            return filtered_candidates
+            
+        except Exception as e:
+            logger.warning(f"후보 영역 검출 실패: {e}")
+            return []
+    
+    def _detect_table_regions(self, gray: np.ndarray) -> List[List[float]]:
+        """표 영역 전용 검출 (격자 구조 기반)"""
+        h, w = gray.shape
+        candidates = []
+        
+        try:
+            # 이진화
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            
+            # 수평/수직선 검출
+            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(15, w//30), 1))
+            vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(15, h//30)))
+            
+            horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
+            vertical_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel)
+            
+            # 격자 구조 생성
+            table_mask = cv2.bitwise_or(horizontal_lines, vertical_lines)
+            
+            # 연결된 구성요소 찾기
+            contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for contour in contours:
+                x, y, bw, bh = cv2.boundingRect(contour)
+                area = bw * bh
+                
+                # 표 후보 필터링
+                if area < 8000:  # 최소 면적
+                    continue
+                if min(bw, bh) < 50:  # 최소 변 길이
+                    continue
+                if max(bw, bh) / min(bw, bh) > 5:  # 종횡비 제한
+                    continue
+                
+                # 격자 밀도 확인
+                roi_mask = table_mask[y:y+bh, x:x+bw]
+                grid_density = cv2.countNonZero(roi_mask) / area if area > 0 else 0
+                
+                if grid_density < 0.01:  # 격자 밀도가 너무 낮으면 제외
+                    continue
+                
+                # 큰 영역은 분할 시도
+                if bw > w * 0.5 and bh > h * 0.2:
+                    split_boxes = self._split_table_region(x, y, bw, bh, horizontal_lines, vertical_lines)
+                    for sx, sy, sw, sh in split_boxes:
+                        norm_bbox = [sx/w, sy/h, (sx+sw)/w, (sy+sh)/h]
+                        candidates.append(norm_bbox)
+                else:
+                    norm_bbox = [x/w, y/h, (x+bw)/w, (y+bh)/h]
+                    candidates.append(norm_bbox)
+            
+        except Exception as e:
+            logger.warning(f"표 영역 검출 실패: {e}")
+        
+        return candidates
+    
+    def _detect_figure_regions(self, gray: np.ndarray) -> List[List[float]]:
+        """그림/다이어그램 영역 검출"""
+        h, w = gray.shape
+        candidates = []
+        
+        try:
+            # 이진화
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            
+            # 노이즈 제거
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+            
+            # 윤곽선 찾기
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for contour in contours:
+                x, y, bw, bh = cv2.boundingRect(contour)
+                area = bw * bh
+                
+                # 그림 후보 필터링
+                if area < 3000:  # 최소 면적 (표보다 작게)
+                    continue
+                if min(bw, bh) < 30:  # 최소 변 길이
+                    continue
+                if max(bw, bh) / min(bw, bh) > 10:  # 종횡비 제한
+                    continue
+                
+                norm_bbox = [x/w, y/h, (x+bw)/w, (y+bh)/h]
+                candidates.append(norm_bbox)
+            
+        except Exception as e:
+            logger.warning(f"그림 영역 검출 실패: {e}")
+        
+        return candidates
+    
+    def _split_table_region(self, x: int, y: int, w: int, h: int, 
+                           h_lines: np.ndarray, v_lines: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        """큰 표 영역을 여러 표로 분할"""
+        try:
+            # ROI 추출
+            roi_h = h_lines[y:y+h, x:x+w]
+            roi_v = v_lines[y:y+h, x:x+w]
+            
+            # 수직 분할선 찾기 (중앙 근처)
+            v_profile = np.sum(roi_v, axis=0)
+            center_x = w // 2
+            search_range = w // 4
+            
+            start_x = max(0, center_x - search_range)
+            end_x = min(w, center_x + search_range)
+            
+            if end_x > start_x:
+                center_region = v_profile[start_x:end_x]
+                if len(center_region) > 0 and np.max(center_region) > h * 0.3:
+                    local_max_idx = np.argmax(center_region)
+                    split_x = start_x + local_max_idx
+                    
+                    # 좌우로 분할
+                    left_box = (x, y, split_x, h)
+                    right_box = (x + split_x, y, w - split_x, h)
+                    
+                    # 최소 크기 확인
+                    if (split_x > 50 and (w - split_x) > 50 and 
+                        split_x * h > 5000 and (w - split_x) * h > 5000):
+                        return [left_box, right_box]
+            
+            # 분할 실패 시 원본 반환
+            return [(x, y, w, h)]
+            
+        except Exception:
+            return [(x, y, w, h)]
+    
+    def _remove_overlapping_candidates(self, candidates: List[List[float]]) -> List[List[float]]:
+        """중복되는 후보 영역 제거"""
+        if len(candidates) <= 1:
+            return candidates
+        
+        # IoU 기반 중복 제거
+        filtered = []
+        for i, bbox1 in enumerate(candidates):
+            is_duplicate = False
+            for j, bbox2 in enumerate(filtered):
+                iou = self._calculate_iou(bbox1, bbox2)
+                if iou > 0.5:  # 50% 이상 겹치면 중복으로 간주
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                filtered.append(bbox1)
+        
+        return filtered
+    
+    def _calculate_iou(self, bbox1: List[float], bbox2: List[float]) -> float:
+        """두 bbox의 IoU 계산"""
+        x1_1, y1_1, x2_1, y2_1 = bbox1
+        x1_2, y1_2, x2_2, y2_2 = bbox2
+        
+        # 교집합 영역
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+        
+        if x2_i <= x1_i or y2_i <= y1_i:
+            return 0.0
+        
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        
+        # 합집합 영역
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
+
+
 if __name__ == "__main__":
     extractor = AdvancedLayoutExtractor()
     

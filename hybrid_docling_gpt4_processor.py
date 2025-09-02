@@ -324,8 +324,12 @@ class HybridDoclingGPT4Processor:
         if not self.adv_extractor:
             return {"tables": [], "figures": [], "elements": [], "method": "disabled"}
         try:
-            # Docling 재실행 방지를 위해 내부의 시각 분석 전용 메서드를 직접 호출
-            layout = self.adv_extractor._extract_with_visual_analysis(pdf_path)
+            # AI 기반 레이아웃 추출 사용
+            if hasattr(self.adv_extractor, '_extract_with_ai_classification'):
+                layout = self.adv_extractor._extract_with_ai_classification(pdf_path)
+            else:
+                # 폴백: 기존 방식
+                layout = self.adv_extractor._extract_with_visual_analysis(pdf_path)
             pages = layout.get("pages", [])
             tables: List[Dict[str, Any]] = []
             figures: List[Dict[str, Any]] = []

@@ -29,6 +29,15 @@ try:
     PYTESSERACT_AVAILABLE = True
 except Exception:
     PYTESSERACT_AVAILABLE = False
+
+# 새로운 분류기 모듈
+try:
+    from table_figure_classifier import TableFigureClassifier
+    from pdf_vector_utils import PDFVectorExtractor
+    ENHANCED_CLASSIFIER_AVAILABLE = True
+except ImportError:
+    ENHANCED_CLASSIFIER_AVAILABLE = False
+    logger.warning("Enhanced classifier modules not found. Using fallback methods.")
     pytesseract = None
 
 logging.basicConfig(level=logging.INFO)

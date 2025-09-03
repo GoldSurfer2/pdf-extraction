@@ -41,6 +41,14 @@ except ImportError:
     AI_CLASSIFIER_AVAILABLE = False
     logger.warning("AI classifier module not found. Using fallback methods.")
 
+# Surya 레이아웃 검출 모듈
+try:
+    from surya.layout import LayoutPredictor
+    SURYA_AVAILABLE = True
+except ImportError:
+    SURYA_AVAILABLE = False
+    logger.warning("Surya layout detection not available. Using OpenCV fallback.")
+
 class ElementType(Enum):
     """문서 요소 타입 정의"""
     TITLE = "title"
@@ -109,6 +117,17 @@ class AdvancedLayoutExtractor:
         else:
             self.ai_classifier = None
             logger.warning("AI 분류기 사용 불가, 기본 방식 사용")
+        
+        # 4. Surya 레이아웃 검출 모델 초기화
+        if SURYA_AVAILABLE:
+            try:
+                self.surya_predictor = LayoutPredictor()
+                logger.info("Surya 레이아웃 검출 모델 초기화 완료")
+            except Exception as e:
+                logger.warning(f"Surya 모델 로드 실패: {e}")
+                self.surya_predictor = None
+        else:
+            self.surya_predictor = None
         
         logger.info(
             "고도화된 레이아웃 추출기 초기화 완료 (Detectron2 미사용, Tesseract OCR: %s)",
@@ -196,8 +215,11 @@ class AdvancedLayoutExtractor:
                 image = Image.open(io.BytesIO(img_data))
                 image_np = np.array(image)
                 
-                # 1단계: OpenCV로 후보 영역 검출 (단순화)
-                candidate_bboxes = self._detect_candidate_regions_simple(image_np)
+                # 1단계: Surya 또는 OpenCV로 후보 영역 검출
+                if self.surya_predictor:
+                    candidate_bboxes = self._detect_candidate_regions_with_surya(image)
+                else:
+                    candidate_bboxes = self._detect_candidate_regions_simple(image_np)
                 
                 # 2단계: AI로 영역 분류
                 if self.ai_classifier and candidate_bboxes:
@@ -1090,6 +1112,50 @@ class AdvancedLayoutExtractor:
         union = area1 + area2 - intersection
         
         return intersection / union if union > 0 else 0.0
+
+    def _detect_candidate_regions_with_surya(self, image: Image.Image) -> List[List[float]]:
+        """Surya를 사용한 고정밀 레이아웃 검출"""
+        try:
+            if not self.surya_predictor:
+                logger.warning("Surya 예측기가 로드되지 않음")
+                return []
+            
+            # Surya 레이아웃 검출 실행
+            layout_result = self.surya_predictor([image])[0]  # 첫 번째 이미지 결과
+            
+            if not layout_result or not hasattr(layout_result, 'bboxes'):
+                logger.warning("Surya 검출 결과 없음")
+                return []
+            
+            candidate_bboxes = []
+            
+            # Surya 결과를 정규화된 bbox로 변환
+            img_width, img_height = image.size
+            
+            for detection in layout_result.bboxes:
+                # Surya bbox 형식: LayoutBox 객체
+                bbox = detection.bbox  # [x1, y1, x2, y2] (픽셀 좌표)
+                x1, y1, x2, y2 = bbox
+                
+                # 정규화 (0~1 범위)
+                norm_bbox = [
+                    x1 / img_width,
+                    y1 / img_height, 
+                    x2 / img_width,
+                    y2 / img_height
+                ]
+                
+                # 유효성 검사
+                if (norm_bbox[2] > norm_bbox[0] and norm_bbox[3] > norm_bbox[1] and
+                    all(0 <= coord <= 1 for coord in norm_bbox)):
+                    candidate_bboxes.append(norm_bbox)
+            
+            logger.info(f"Surya 레이아웃 검출: {len(candidate_bboxes)}개 영역")
+            return candidate_bboxes
+            
+        except Exception as e:
+            logger.error(f"Surya 레이아웃 검출 실패: {e}")
+            return []
 
 
 if __name__ == "__main__":
